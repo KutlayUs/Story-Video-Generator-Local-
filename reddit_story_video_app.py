@@ -12,9 +12,9 @@ from pathlib import Path
 import json # Import json for parsing Whisper output
 
 # MoviePy imports are here but will be checked and imported again for safety later
-from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, ColorClip
-from moviepy.video.tools.subtitles import SubtitlesClip # Still imported, but not directly used for word-level
-from moviepy.video.VideoClip import TextClip
+# from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, ColorClip
+# from moviepy.video.tools.subtitles import SubtitlesClip # Still imported, but not directly used for word-level
+# from moviepy.video.VideoClip import TextClip
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -59,13 +59,41 @@ def preprocess_text_for_tts(text):
     # Replace problematic characters
     text = text.replace('\n', '. ')
     text = text.replace('\t', ' ')
-    text = re.sub(r'[^\w\s.,!?;:\-\'\"]', '', text) 
+    # Allow a broader range of characters often found in Reddit posts, but still clean
+    text = re.sub(r'[^\w\s.,!?;:\-\'\"#@$%&*\(\)\[\]\{\}\\/]', '', text) 
     
     # Ensure no double periods from replacements or existing text
-    text = re.sub(r'\. +\.?', '.', text)
     text = re.sub(r'(\.\s*){2,}', '. ', text)
     
     return text
+
+# Font verification function
+# MoviePy imports need to be conditional here because they might not be installed yet
+# We'll make sure they are imported before this function is called.
+_moviepy_imported_for_font_check = False
+def verify_font_file(font_path):
+    """
+    Verify that the font file can be used by MoviePy by attempting to create a TextClip.
+    """
+    global _moviepy_imported_for_font_check
+    if not _moviepy_imported_for_font_check:
+        try:
+            from moviepy.video.VideoClip import TextClip as MoviePyTextClip # Use an alias to avoid conflict
+            _moviepy_imported_for_font_check = True
+        except ImportError:
+            logger.error("MoviePy TextClip not available for font verification. Is MoviePy installed?")
+            return False
+    else:
+        from moviepy.video.VideoClip import TextClip as MoviePyTextClip # Re-import alias if already checked
+
+    try:
+        # Test creating a simple TextClip with the font
+        test_clip = MoviePyTextClip("Test", font=font_path, fontsize=20)
+        test_clip.close()  # Clean up
+        return True
+    except Exception as e:
+        logger.error(f"Font verification failed for {font_path}: {e}")
+        return False
 
 # Dependency checks
 missing = []
@@ -116,6 +144,7 @@ try:
     from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, ColorClip
     from moviepy.video.tools.subtitles import SubtitlesClip
     from moviepy.video.VideoClip import TextClip
+    _moviepy_imported_for_font_check = True # Confirm MoviePy TextClip is available now
 except ImportError as e:
     st.error(f"Failed to import MoviePy components: {e}")
     st.stop()
@@ -138,7 +167,7 @@ def get_ollama_models():
         resp.raise_for_status()
         data = resp.json()
         return [m["name"] for m in data.get("models", [])]
-    except Exception as e:
+    except Exception as e: # Catch all exceptions from requests
         logger.error(f"Failed to get Ollama models: {e}")
         return []
 
@@ -183,10 +212,6 @@ output_dir = st.text_input("Output folder (absolute path, leave blank for defaul
 st.header("6. Subtitle Appearance")
 # Font Upload
 uploaded_font = st.file_uploader("Upload custom font (.ttf, .otf):", type=["ttf", "otf"])
-# 'None' will make MoviePy use its internal default font, which is usually reliable.
-# If you want a specific system font (like Arial) as a fallback, you could set this to 'Arial'
-# but it's less cross-platform reliable than MoviePy's internal default.
-default_fallback_font_param = None 
 
 # Font Parameters
 col1, col2 = st.columns(2)
@@ -270,8 +295,8 @@ if st.button("Generate Video"):
                 with open(story_txt, "w", encoding="utf-8") as f:
                     f.write(processed_story)
 
-                # Determine font path to use for MoviePy
-                font_path_for_moviepy = default_fallback_font_param # Start with the robust fallback
+                # Improved font path handling
+                font_path_for_moviepy = None  # Start with None for MoviePy's default
 
                 if uploaded_font:
                     font_filename = uploaded_font.name
@@ -281,25 +306,27 @@ if st.button("Generate Video"):
                     else:
                         font_save_path = os.path.join(tmpdir, font_filename)
                         try:
+                            # Reset file pointer to beginning
+                            uploaded_font.seek(0)
                             with open(font_save_path, "wb") as f:
                                 f.write(uploaded_font.read())
-                            font_path_for_moviepy = font_save_path # Use the absolute path if successfully saved
-                            st.info(f"Using custom font from file: {font_path_for_moviepy}")
+                            
+                            # Verify the font file was saved and has content
+                            if os.path.exists(font_save_path) and os.path.getsize(font_save_path) > 0:
+                                # Test the font before using it
+                                if verify_font_file(font_save_path):
+                                    font_path_for_moviepy = font_save_path
+                                    st.success(f"Custom font '{font_filename}' verified and will be used for subtitles.")
+                                else:
+                                    st.error(f"Custom font '{font_filename}' failed verification. This might be due to a corrupt or incompatible font file. Using MoviePy's default font.")
+                                    font_path_for_moviepy = None # Explicitly set to None
+                            else:
+                                st.error("Font file was not saved properly or is empty. Using MoviePy's default font.")
+                                
                         except Exception as e:
-                            st.error(f"Failed to save custom font file: {e}. Attempting to use MoviePy's default font.")
+                            st.error(f"Failed to save or process custom font file: {e}. Using MoviePy's default font.")
                 else:
-                    st.info(f"No custom font uploaded. MoviePy will use its default font.")
-                
-                # --- Debugging Font Path ---
-                logger.info(f"MoviePy TextClip 'font' parameter will be: {font_path_for_moviepy}")
-                if isinstance(font_path_for_moviepy, str) and os.path.exists(font_path_for_moviepy): # Check if it's an actual file path
-                    logger.info(f"Font file physically exists at path: {font_path_for_moviepy}")
-                elif font_path_for_moviepy is not None: # It's a string, but not a file path (e.g., 'Arial')
-                     logger.warning(f"Font parameter '{font_path_for_moviepy}' is a string, but does not point to an existing file. MoviePy will try to resolve it as a system font name or fall back to a generic font.")
-                else: # font_path_for_moviepy is None
-                    logger.info(f"Font parameter is None. MoviePy will use its internal default font (e.g., LiberationSans).")
-                # --- End Debugging Font Path ---
-
+                    st.info("No custom font uploaded. MoviePy's default font will be used for subtitles.")
 
                 # Step 2: Text to Speech (Coqui TTS)
                 story_wav = os.path.join(tmpdir, "story.wav")
@@ -330,19 +357,27 @@ if st.button("Generate Video"):
                 
                 try:
                     current_whisper_model = whisper_model if whisper_model else "base"
-                    result = subprocess.run([
+                    # Whisper might output to story.wav.json, so let's be explicit with the full path
+                    whisper_command = [
                         'whisper', story_wav, 
                         '--model', current_whisper_model, 
-                        '--output_format', 'json', # Request JSON output
-                        '--output_dir', tmpdir,
+                        '--output_format', 'json', 
+                        '--output_dir', tmpdir, # Output dir is important
                         '--language', 'en', 
-                        '--word_timestamps', 'True' # Crucial for word-level timestamps
-                    ], capture_output=True, text=True, check=True)
+                        '--word_timestamps', 'True' 
+                    ]
+                    logger.info(f"Running Whisper command: {' '.join(whisper_command)}")
+                    result = subprocess.run(whisper_command, capture_output=True, text=True, check=True)
                     
-                    if not os.path.exists(word_timestamps_json) or os.path.getsize(word_timestamps_json) == 0:
+                    # Construct the expected JSON path based on Whisper's default naming (e.g., story.json)
+                    expected_json_path = os.path.join(tmpdir, f"{Path(story_wav).stem}.json")
+
+                    if not os.path.exists(expected_json_path) or os.path.getsize(expected_json_path) == 0:
+                        logger.error(f"Whisper stdout: {result.stdout}")
                         logger.error(f"Whisper stderr: {result.stderr}")
-                        raise Exception("No JSON file with word timestamps was generated by Whisper. Check Whisper output for errors.")
+                        raise Exception(f"No JSON file with word timestamps was generated by Whisper at {expected_json_path}. Check Whisper output for errors.")
                     
+                    word_timestamps_json = expected_json_path # Update to the correct path
                     st.success("Word-level timestamps generated!")
                     
                 except subprocess.CalledProcessError as e:
@@ -357,6 +392,8 @@ if st.button("Generate Video"):
                 st.info("Saving uploaded video...")
                 video_path = os.path.join(tmpdir, "background.mp4")
                 try:
+                    # Reset file pointer to beginning
+                    video_file.seek(0)
                     with open(video_path, "wb") as f:
                         f.write(video_file.read())
                     if not os.path.isfile(video_path) or os.path.getsize(video_path) == 0:
@@ -371,6 +408,7 @@ if st.button("Generate Video"):
                     os.makedirs(output_dir, exist_ok=True)
                     final_video_output_path = os.path.join(output_dir, output_video_name)
                 else:
+                    # If output_dir is not provided or invalid, use tmpdir
                     final_video_output_path = os.path.join(tmpdir, output_video_name) 
 
                 # Step 5: Merge audio and word-level subtitles with video using MoviePy
@@ -395,27 +433,42 @@ if st.button("Generate Video"):
                     r_bg, g_bg, b_bg = hex_to_rgb(bg_color_rgb)
                     bg_color_rgba_str = f"rgba({r_bg},{g_bg},{b_bg},{bg_opacity})"
                     
-                    # Define the subtitle text clip generator AFTER video_clip is loaded
-                    def make_word_text_clip(txt, font_param, font_size_arg, text_color_arg, stroke_color_arg, bg_color_rgba_str_arg):
+                    # Improved text clip creation function
+                    def make_word_text_clip(txt, font_param, font_size_arg, text_color_arg, stroke_color_arg, bg_color_rgba_str_arg, video_width):
+                        """
+                        Create a TextClip with proper font handling and fallback options.
+                        """
+                        text_clip_kwargs = {
+                            'fontsize': font_size_arg, 
+                            'color': text_color_arg, 
+                            'stroke_color': stroke_color_arg, 
+                            'stroke_width': 2, 
+                            'bg_color': bg_color_rgba_str_arg, 
+                            'method': 'caption',
+                            'size': (video_width * 0.8, None), # Max 80% width
+                            'align': 'center'
+                        }
+                        
                         try:
-                            # Added `interline` for multi-line text spacing, can be adjusted
-                            return TextClip(txt, font=font_param, fontsize=font_size_arg, color=text_color_arg, 
-                                            stroke_color=stroke_color_arg, stroke_width=2, 
-                                            bg_color=bg_color_rgba_str_arg, 
-                                            method='caption', # Ensures text wraps within the given size
-                                            size=(video_clip.w * 0.8, None), # Max width 80% of video width
-                                            align='center',
-                                            interline=font_size_arg * 0.1 # Adjust line spacing if needed
-                                            )
+                            # First attempt with the specified font if available
+                            if font_param is not None:
+                                return TextClip(txt, font=font_param, **text_clip_kwargs)
+                            else:
+                                # Use MoviePy's default font when font_param is None
+                                return TextClip(txt, **text_clip_kwargs)
+                                
                         except Exception as e:
                             logger.error(f"Error creating TextClip for text '{txt}' with font '{font_param}': {e}")
-                            st.warning(f"Could not render text '{txt}' with selected font/parameters. Falling back to default font for this text.")
-                            # Fallback to a very generic font or no font specified
-                            return TextClip(txt, font=None, fontsize=font_size_arg, color=text_color_arg,
-                                            stroke_color=stroke_color_arg, stroke_width=2,
-                                            bg_color=bg_color_rgba_str_arg,
-                                            method='caption', size=(video_clip.w * 0.8, None), align='center')
-
+                            st.warning(f"Could not render text '{txt}' with selected font '{font_param if font_param else 'default'}'. Using fallback to MoviePy's default font.")
+                            
+                            # Fallback attempt without specifying font (MoviePy's default)
+                            try:
+                                return TextClip(txt, **{k: v for k, v in text_clip_kwargs.items() if k != 'font'})
+                            except Exception as fallback_error:
+                                logger.error(f"Fallback TextClip creation also failed: {fallback_error}")
+                                # Last resort - minimal TextClip without any advanced styling
+                                st.error(f"Extreme fallback for text '{txt}' - minimal styling due to rendering issues.")
+                                return TextClip(txt, fontsize=font_size_arg, color=text_color_arg)
 
                     # Create individual TextClips for each word
                     for segment in whisper_data.get('segments', []):
@@ -426,7 +479,7 @@ if st.button("Generate Video"):
 
                             if word_text: 
                                 word_clip = make_word_text_clip(word_text, font_path_for_moviepy, font_size, 
-                                                                text_color, stroke_color, bg_color_rgba_str)
+                                                                text_color, stroke_color, bg_color_rgba_str, video_clip.w)
                                 
                                 word_clip = word_clip.set_start(word_start).set_duration(word_end - word_start)
                                 word_clip = word_clip.set_position(('center', 'center')) 
@@ -435,7 +488,7 @@ if st.button("Generate Video"):
 
                     # Calculate durations and adjust video length
                     audio_duration = audio_clip.duration
-                    desired_duration = audio_duration + 1.0 
+                    desired_duration = audio_duration + 1.0 # Add a small buffer at the end
 
                     if video_clip.duration < desired_duration:
                         loops = int(desired_duration // video_clip.duration) + 1
@@ -482,7 +535,12 @@ if st.button("Generate Video"):
                     # Explicitly close all MoviePy objects to free resources
                     if video_clip: video_clip.close()
                     if audio_clip: audio_clip.close()
+                    # It's good practice to close composite clips too
                     if final_clip: final_clip.close()
+                    # Also close individual word clips if they're still in memory
+                    for clip in all_word_clips:
+                        if hasattr(clip, 'close'):
+                            clip.close()
 
             except Exception as e:
                 st.error(f"An unexpected error occurred in the overall pipeline: {e}")
@@ -527,6 +585,16 @@ with st.expander("Troubleshooting Tips"):
         *   Ensure sufficient disk space in your temporary directory or chosen output folder.
         *   Try shorter background videos (< 2 minutes).
         *   Sometimes, specific video codecs can cause issues. MoviePy generally handles common ones well, but highly compressed or obscure codecs might cause problems.
+
+    8.  **Font Issues (If your custom font isn't showing):**
+        *   **Check the Streamlit messages:** The app now provides more explicit messages about whether your uploaded font was successfully verified and is being used, or if it's falling back to the default. Look for `st.success` or `st.error` messages related to fonts during video generation.
+        *   **Font File Validity:** Not all `.ttf` or `.otf` files are created equally. Some fonts might be malformed or use advanced features that MoviePy's underlying rendering library (Pillow/PIL) doesn't fully support.
+            *   **Try a very common font:** Download a well-known, simple font like `Roboto-Regular.ttf` (from Google Fonts) or `OpenSans-Regular.ttf` and try uploading that. If a common font works, the issue is likely with your specific custom font.
+            *   **Corrupted file:** Ensure the font file itself isn't corrupted.
+        *   **Verify in a text editor:** Can you open the font file with a standard font viewer or text editor on your operating system?
+        *   **Permissions:** While unlikely in a temporary directory, ensure there are no strange file permissions preventing MoviePy from reading the saved font file.
+        *   **MoviePy/Pillow versions:** Ensure your MoviePy and Pillow installations are up-to-date (`pip install --upgrade moviepy pillow`).
+        *   **Restart the app:** Sometimes a fresh restart of the Streamlit app can resolve caching or resource issues.
     """)
 
 # Add debug option
