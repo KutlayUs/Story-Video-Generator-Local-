@@ -9,12 +9,18 @@ import time
 import logging
 import re
 from pathlib import Path
-import json # Import json for parsing Whisper output
+import json
+
+# Import PIL for direct image rendering
+from PIL import Image, ImageDraw, ImageFont
+
+# Import numpy for converting PIL images to MoviePy compatible arrays
+import numpy as np
 
 # MoviePy imports are here but will be checked and imported again for safety later
-# from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, ColorClip
-# from moviepy.video.tools.subtitles import SubtitlesClip # Still imported, but not directly used for word-level
-# from moviepy.video.VideoClip import TextClip
+from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, ColorClip
+from moviepy.video.VideoClip import ImageClip # We'll use ImageClip for rendered text
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -67,29 +73,14 @@ def preprocess_text_for_tts(text):
     
     return text
 
-# Font verification function
-# MoviePy imports need to be conditional here because they might not be installed yet
-# We'll make sure they are imported before this function is called.
+# Font verification function (now simplified as Pillow will handle the direct rendering)
 _moviepy_imported_for_font_check = False
 def verify_font_file(font_path):
     """
-    Verify that the font file can be used by MoviePy by attempting to create a TextClip.
+    Verify that the font file can be loaded by Pillow.
     """
-    global _moviepy_imported_for_font_check
-    if not _moviepy_imported_for_font_check:
-        try:
-            from moviepy.video.VideoClip import TextClip as MoviePyTextClip # Use an alias to avoid conflict
-            _moviepy_imported_for_font_check = True
-        except ImportError:
-            logger.error("MoviePy TextClip not available for font verification. Is MoviePy installed?")
-            return False
-    else:
-        from moviepy.video.VideoClip import TextClip as MoviePyTextClip # Re-import alias if already checked
-
     try:
-        # Test creating a simple TextClip with the font
-        test_clip = MoviePyTextClip("Test", font=font_path, fontsize=20)
-        test_clip.close()  # Clean up
+        ImageFont.truetype(font_path, 1) # Try to load a tiny size
         return True
     except Exception as e:
         logger.error(f"Font verification failed for {font_path}: {e}")
@@ -112,6 +103,13 @@ if not is_command_available("ollama"):
 if not is_python_package_installed("moviepy"):
     missing.append("moviepy (pip install moviepy)")
     installable.append(("moviepy", "pip"))
+if not is_python_package_installed("PIL"): # Corrected for Pillow module name
+    missing.append("Pillow (pip install Pillow)")
+    installable.append(("Pillow", "pip")) 
+if not is_python_package_installed("numpy"):
+    missing.append("numpy (pip install numpy)")
+    installable.append(("numpy", "pip"))
+
 
 if missing:
     st.error("Missing dependencies:\n" + "\n".join(f"- {m}" for m in missing))
@@ -142,9 +140,8 @@ except ImportError as e:
 # Import MoviePy after dependency check
 try:
     from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, ColorClip
-    from moviepy.video.tools.subtitles import SubtitlesClip
-    from moviepy.video.VideoClip import TextClip
-    _moviepy_imported_for_font_check = True # Confirm MoviePy TextClip is available now
+    from moviepy.video.VideoClip import ImageClip # We'll use ImageClip for rendered text
+    _moviepy_imported_for_font_check = True # Confirm MoviePy components are available now
 except ImportError as e:
     st.error(f"Failed to import MoviePy components: {e}")
     st.stop()
@@ -179,7 +176,7 @@ else:
     if not ollama_models:
         st.warning("Could not connect to Ollama. Make sure it's running on localhost:11434")
 
-# --- Step 2: TTS Model Selection ---
+# --- Step 2: Text-to-Speech (Coqui TTS) ---
 st.header("2. Text-to-Speech (Coqui TTS)")
 tts_models = [
     "tts_models/en/ljspeech/tacotron2-DDC",
@@ -190,6 +187,15 @@ tts_models = [
     "tts_models/en/ljspeech/overflow",
 ]
 tts_model = st.selectbox("Select TTS model:", tts_models)
+# Add speech speed control
+speech_speed = st.slider(
+    "Speech Speed:", 
+    min_value=0.5, 
+    max_value=2.0, 
+    value=1.0, 
+    step=0.05,
+    help="Control the speed of speech (1.0 is normal, <1.0 is slower, >1.0 is faster)."
+)
 
 # --- Step 3: Whisper Model Selection ---
 st.header("3. Speech-to-Text (Whisper)")
@@ -219,9 +225,105 @@ with col1:
     font_size = st.number_input("Font Size:", min_value=10, max_value=100, value=40)
     text_color = st.color_picker("Text Color:", value="#FFFFFF") # White (hex)
     stroke_color = st.color_picker("Outline Color:", value="#000000") # Black (hex)
+    stroke_width = st.number_input("Outline Width:", min_value=0, max_value=5, value=2)
 with col2:
     bg_color_rgb = st.color_picker("Background Color:", value="#000000") # Black (hex)
     bg_opacity = st.slider("Background Opacity:", min_value=0.0, max_value=1.0, value=0.7, step=0.05)
+    padding = st.number_input("Padding (around text):", min_value=0, max_value=20, value=10)
+
+
+# Function to render text onto a Pillow image
+def render_text_to_pillow_image(
+    text, 
+    font_path, 
+    font_size, 
+    text_color_hex, 
+    stroke_color_hex, 
+    stroke_width_pixels, 
+    bg_color_hex, 
+    bg_opacity_float, 
+    padding_pixels,
+    max_width_pixels # Maximum width for text wrapping
+):
+    try:
+        # Load font. If font_path is None or invalid, try a common system font.
+        try:
+            if font_path and os.path.exists(font_path):
+                font = ImageFont.truetype(font_path, font_size)
+            else:
+                # Fallback to common system fonts if custom font is not provided or invalid
+                # This might vary across OS. Arial is common on Windows, DejaVuSans on Linux.
+                if sys.platform == "win32":
+                    font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", font_size)
+                    logger.warning(f"Using fallback font: C:/Windows/Fonts/arial.ttf for text '{text}'")
+                elif sys.platform == "darwin": # macOS
+                    font = ImageFont.truetype("/Library/Fonts/Arial.ttf", font_size)
+                    logger.warning(f"Using fallback font: /Library/Fonts/Arial.ttf for text '{text}'")
+                else: # Linux and others
+                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+                    logger.warning(f"Using fallback font: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf for text '{text}'")
+        except Exception as e:
+            logger.error(f"Could not load specified or fallback font, using default Pillow font: {e}")
+            font = ImageFont.load_default() # Last resort fallback
+
+        # Create a dummy image and draw object to calculate text size
+        dummy_img = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
+        draw_dummy = ImageDraw.Draw(dummy_img)
+
+        # Calculate text bounding box including stroke
+        # textbbox gives (left, top, right, bottom)
+        bbox = draw_dummy.textbbox((0, 0), text, font=font, stroke_width=stroke_width_pixels)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+
+        # Calculate image size with padding and ensure min size
+        img_width = text_width + 2 * padding_pixels
+        img_height = text_height + 2 * padding_pixels
+        
+        # Ensure image width doesn't exceed max_width_pixels if it's too large initially
+        if img_width > max_width_pixels:
+            img_width = max_width_pixels # Cap it if the word itself is too long
+
+        # Create a transparent image
+        img = Image.new('RGBA', (img_width, img_height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # Draw background rectangle
+        if bg_opacity_float > 0:
+            r_bg, g_bg, b_bg = hex_to_rgb(bg_color_hex)
+            alpha_bg = int(255 * bg_opacity_float)
+            draw.rectangle(
+                [(0, 0), (img_width, img_height)], 
+                fill=(r_bg, g_bg, b_bg, alpha_bg)
+            )
+
+        # Draw text
+        text_color_rgb = hex_to_rgb(text_color_hex)
+        stroke_color_rgb = hex_to_rgb(stroke_color_hex)
+
+        # Position text in the center of the image
+        text_x = padding_pixels - bbox[0] # Adjust for potential negative bbox[0]
+        text_y = padding_pixels - bbox[1] # Adjust for potential negative bbox[1]
+
+        draw.text(
+            (text_x, text_y), 
+            text, 
+            font=font, 
+            fill=text_color_rgb, 
+            stroke_width=stroke_width_pixels, 
+            stroke_fill=stroke_color_rgb
+        )
+        
+        return img
+
+    except Exception as e:
+        logger.error(f"Error rendering text '{text}' with Pillow: {e}")
+        st.warning(f"Could not render text '{text}' with specified font/settings. Using basic rendering.")
+        # Fallback to a basic solid color image if all else fails
+        fallback_img = Image.new('RGBA', (100, 50), (255,0,0,255)) # Red solid image for error visibility
+        draw_fallback = ImageDraw.Draw(fallback_img)
+        draw_fallback.text((10,10), "?", fill=(0,0,0))
+        return fallback_img
 
 
 # --- Step 7: Generate Story First ---
@@ -251,7 +353,7 @@ if st.button("Generate Story"):
                     },
                     timeout=120
                 )
-                response.raise_for_status()
+                response.raise_for_status() # Corrected line
                 story = response.json().get("response", "").strip()
                 
                 if story:
@@ -302,7 +404,7 @@ if st.button("Generate Video"):
                     font_filename = uploaded_font.name
                     # Check if the uploaded file has a valid font extension
                     if not (font_filename.lower().endswith('.ttf') or font_filename.lower().endswith('.otf')):
-                        st.warning(f"Uploaded file '{font_filename}' is not a valid font type (.ttf or .otf). Attempting to use MoviePy's default font.")
+                        st.warning(f"Uploaded file '{font_filename}' is not a valid font type (.ttf or .otf). Attempting to use a system font.")
                     else:
                         font_save_path = os.path.join(tmpdir, font_filename)
                         try:
@@ -313,20 +415,20 @@ if st.button("Generate Video"):
                             
                             # Verify the font file was saved and has content
                             if os.path.exists(font_save_path) and os.path.getsize(font_save_path) > 0:
-                                # Test the font before using it
+                                # Test the font before using it with Pillow
                                 if verify_font_file(font_save_path):
-                                    font_path_for_moviepy = font_save_path
+                                    font_path_for_moviepy = font_save_path # Renamed variable for clarity
                                     st.success(f"Custom font '{font_filename}' verified and will be used for subtitles.")
                                 else:
-                                    st.error(f"Custom font '{font_filename}' failed verification. This might be due to a corrupt or incompatible font file. Using MoviePy's default font.")
+                                    st.error(f"Custom font '{font_filename}' failed verification. This might be due to a corrupt or incompatible font file. Using a system font fallback.")
                                     font_path_for_moviepy = None # Explicitly set to None
                             else:
-                                st.error("Font file was not saved properly or is empty. Using MoviePy's default font.")
+                                st.error("Font file was not saved properly or is empty. Using a system font fallback.")
                                 
                         except Exception as e:
-                            st.error(f"Failed to save or process custom font file: {e}. Using MoviePy's default font.")
+                            st.error(f"Failed to save or process custom font file: {e}. Using a system font fallback.")
                 else:
-                    st.info("No custom font uploaded. MoviePy's default font will be used for subtitles.")
+                    st.info("No custom font uploaded. A common system font will be used for subtitles.")
 
                 # Step 2: Text to Speech (Coqui TTS)
                 story_wav = os.path.join(tmpdir, "story.wav")
@@ -337,7 +439,8 @@ if st.button("Generate Video"):
                     current_tts_model = tts_model if tts_model else "tts_models/en/ljspeech/tacotron2-DDC"
                     tts = TTS(current_tts_model, progress_bar=False)
                     progress_bar.progress(30, text="Generating audio...")
-                    tts.tts_to_file(text=processed_story, file_path=story_wav)
+                    # Pass the speech_speed parameter here!
+                    tts.tts_to_file(text=processed_story, file_path=story_wav, speed=speech_speed) 
                     progress_bar.progress(50, text="Audio generated successfully!")
                     
                     if not os.path.exists(story_wav) or os.path.getsize(story_wav) == 0:
@@ -428,49 +531,8 @@ if st.button("Generate Video"):
                     # Read and parse the word-level JSON output from Whisper
                     with open(word_timestamps_json, 'r', encoding='utf-8') as f:
                         whisper_data = json.load(f)
-
-                    # Construct rgba string for background color using the helper
-                    r_bg, g_bg, b_bg = hex_to_rgb(bg_color_rgb)
-                    bg_color_rgba_str = f"rgba({r_bg},{g_bg},{b_bg},{bg_opacity})"
                     
-                    # Improved text clip creation function
-                    def make_word_text_clip(txt, font_param, font_size_arg, text_color_arg, stroke_color_arg, bg_color_rgba_str_arg, video_width):
-                        """
-                        Create a TextClip with proper font handling and fallback options.
-                        """
-                        text_clip_kwargs = {
-                            'fontsize': font_size_arg, 
-                            'color': text_color_arg, 
-                            'stroke_color': stroke_color_arg, 
-                            'stroke_width': 2, 
-                            'bg_color': bg_color_rgba_str_arg, 
-                            'method': 'caption',
-                            'size': (video_width * 0.8, None), # Max 80% width
-                            'align': 'center'
-                        }
-                        
-                        try:
-                            # First attempt with the specified font if available
-                            if font_param is not None:
-                                return TextClip(txt, font=font_param, **text_clip_kwargs)
-                            else:
-                                # Use MoviePy's default font when font_param is None
-                                return TextClip(txt, **text_clip_kwargs)
-                                
-                        except Exception as e:
-                            logger.error(f"Error creating TextClip for text '{txt}' with font '{font_param}': {e}")
-                            st.warning(f"Could not render text '{txt}' with selected font '{font_param if font_param else 'default'}'. Using fallback to MoviePy's default font.")
-                            
-                            # Fallback attempt without specifying font (MoviePy's default)
-                            try:
-                                return TextClip(txt, **{k: v for k, v in text_clip_kwargs.items() if k != 'font'})
-                            except Exception as fallback_error:
-                                logger.error(f"Fallback TextClip creation also failed: {fallback_error}")
-                                # Last resort - minimal TextClip without any advanced styling
-                                st.error(f"Extreme fallback for text '{txt}' - minimal styling due to rendering issues.")
-                                return TextClip(txt, fontsize=font_size_arg, color=text_color_arg)
-
-                    # Create individual TextClips for each word
+                    # Create individual ImageClips for each word using Pillow
                     for segment in whisper_data.get('segments', []):
                         for word_data in segment.get('words', []):
                             word_text = word_data['word'].strip() 
@@ -478,8 +540,25 @@ if st.button("Generate Video"):
                             word_end = word_data['end']
 
                             if word_text: 
-                                word_clip = make_word_text_clip(word_text, font_path_for_moviepy, font_size, 
-                                                                text_color, stroke_color, bg_color_rgba_str, video_clip.w)
+                                # Render text with Pillow
+                                pil_image = render_text_to_pillow_image(
+                                    word_text, 
+                                    font_path_for_moviepy, 
+                                    font_size, 
+                                    text_color, 
+                                    stroke_color, 
+                                    stroke_width, 
+                                    bg_color_rgb, 
+                                    bg_opacity, 
+                                    padding,
+                                    video_clip.w * 0.8 # Max 80% width of video for text
+                                )
+                                
+                                # Convert Pillow image to a NumPy array
+                                img_array = np.array(pil_image)
+                                
+                                # Convert NumPy array to MoviePy ImageClip
+                                word_clip = ImageClip(img_array, ismask=False) 
                                 
                                 word_clip = word_clip.set_start(word_start).set_duration(word_end - word_start)
                                 word_clip = word_clip.set_position(('center', 'center')) 
@@ -588,12 +667,12 @@ with st.expander("Troubleshooting Tips"):
 
     8.  **Font Issues (If your custom font isn't showing):**
         *   **Check the Streamlit messages:** The app now provides more explicit messages about whether your uploaded font was successfully verified and is being used, or if it's falling back to the default. Look for `st.success` or `st.error` messages related to fonts during video generation.
-        *   **Font File Validity:** Not all `.ttf` or `.otf` files are created equally. Some fonts might be malformed or use advanced features that MoviePy's underlying rendering library (Pillow/PIL) doesn't fully support.
+        *   **Font File Validity:** Not all `.ttf` or `.otf` files are created equally. Some fonts might be malformed or use advanced features that Pillow doesn't fully support.
             *   **Try a very common font:** Download a well-known, simple font like `Roboto-Regular.ttf` (from Google Fonts) or `OpenSans-Regular.ttf` and try uploading that. If a common font works, the issue is likely with your specific custom font.
             *   **Corrupted file:** Ensure the font file itself isn't corrupted.
         *   **Verify in a text editor:** Can you open the font file with a standard font viewer or text editor on your operating system?
-        *   **Permissions:** While unlikely in a temporary directory, ensure there are no strange file permissions preventing MoviePy from reading the saved font file.
-        *   **MoviePy/Pillow versions:** Ensure your MoviePy and Pillow installations are up-to-date (`pip install --upgrade moviepy pillow`).
+        *   **Permissions:** While unlikely in a temporary directory, ensure there are no strange file permissions preventing Pillow from reading the saved font file.
+        *   **Pillow version:** Ensure your Pillow installation is up-to-date (`pip install --upgrade Pillow`).
         *   **Restart the app:** Sometimes a fresh restart of the Streamlit app can resolve caching or resource issues.
     """)
 
@@ -606,6 +685,8 @@ with st.expander("Debug Information"):
         st.write(f"- Ollama available: {is_command_available('ollama')}")
         st.write(f"- TTS available: {is_python_package_installed('TTS')}")
         st.write(f"- MoviePy available: {is_python_package_installed('moviepy')}")
+        st.write(f"- Pillow available: {is_python_package_installed('PIL')}")
+        st.write(f"- Numpy available: {is_python_package_installed('numpy')}")
         
         if is_command_available('ffmpeg'):
             try:
